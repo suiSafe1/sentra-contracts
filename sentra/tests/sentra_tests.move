@@ -46,7 +46,7 @@ fun setup_with_token(scenario: &mut Scenario) {
     scenario.next_tx(ADMIN);
     {
         let mut platform = scenario.take_shared<Platform>();
-        let cap     = scenario.take_from_sender<AdminCap>();
+        let cap          = scenario.take_from_sender<AdminCap>();
         sentra::add_token_support<USDC>(&cap, &mut platform, scenario.ctx());
         test_scenario::return_shared(platform);
         scenario.return_to_sender(cap);
@@ -72,6 +72,7 @@ fun make_clock(ts_ms: u64, ctx: &mut sui::tx_context::TxContext): Clock {
 }
 
 
+/// M-04: strategy parameter removed from create_lock — Lock type encodes strategy.
 fun create_user_lock(
     scenario: &mut Scenario,
     amount: u64,
@@ -88,7 +89,6 @@ fun create_user_lock(
             &mut registry,
             coin,
             duration_ms,
-            0,
             &clock,
             scenario.ctx(),
         );
@@ -107,7 +107,7 @@ fun test_init_creates_shared_objects() {
     {
         let platform = scenario.take_shared<Platform>();
         let registry = scenario.take_shared<UserRegistry>();
-        let cap = scenario.take_from_sender<AdminCap>();
+        let cap      = scenario.take_from_sender<AdminCap>();
 
         assert!(sentra::get_admin(&platform) == ADMIN, 0);
         let (dep_paused, wit_paused) = sentra::get_pause_status(&platform);
@@ -146,8 +146,7 @@ fun test_add_token_support_non_admin_fails() {
     scenario.next_tx(USER);
     {
         let mut platform = scenario.take_shared<Platform>();
-
-        let cap = test_scenario::take_from_address<AdminCap>(&scenario, ADMIN);
+        let cap          = test_scenario::take_from_address<AdminCap>(&scenario, ADMIN);
         sentra::add_token_support<SCOIN>(&cap, &mut platform, scenario.ctx());
         test_scenario::return_to_address(ADMIN, cap);
         test_scenario::return_shared(platform);
@@ -251,13 +250,14 @@ fun test_create_lock_when_deposits_paused_fails() {
         scenario.return_to_sender(cap);
     };
 
+    // M-04: no strategy arg
     scenario.next_tx(USER);
     {
         let mut platform = scenario.take_shared<Platform>();
         let mut registry = scenario.take_shared<UserRegistry>();
         let coin         = coin::mint_for_testing<USDC>(10_000, scenario.ctx());
         let clock        = make_clock(0, scenario.ctx());
-        sentra::create_lock<USDC>(&mut platform, &mut registry, coin, 1000, 0, &clock, scenario.ctx());
+        sentra::create_lock<USDC>(&mut platform, &mut registry, coin, 1000, &clock, scenario.ctx());
         clock::destroy_for_testing(clock);
         test_scenario::return_shared(platform);
         test_scenario::return_shared(registry);
@@ -312,18 +312,18 @@ fun test_create_lock_success() {
 
         assert!(sentra::lock_owner(&lock) == USER, 0);
         assert!(sentra::lock_duration_ms(&lock) == 30_000, 1);
-        assert!(sentra::lock_strategy(&lock) == 0, 2);
+        // M-04: lock_strategy removed — Lock type itself encodes the strategy
 
-      
+        // Default deposit fee: ceil(10_000 * 10 / 10_000) = 10
         let bal = sentra::lock_balance_value(&lock);
-        assert!(bal == 9_990, 3);
+        assert!(bal == 9_990, 2);
 
-        let tvl_map = sentra::platform_tvl_by_token(&platform);
+        let tvl_map    = sentra::platform_tvl_by_token(&platform);
         let token_type = std::type_name::with_original_ids<USDC>();
-        assert!(*sui::vec_map::get(tvl_map, &token_type) == 9_990, 4);
+        assert!(*sui::vec_map::get(tvl_map, &token_type) == 9_990, 3);
 
-        let user_locks = sentra::get_user_locks(&registry, USER);
-        assert!(vector::length(&user_locks) == 1, 5);
+        // M-03: get_user_locks (vector) removed — use user_has_locks O(1) check
+        assert!(sentra::user_has_locks(&registry, USER), 4);
 
         test_scenario::return_shared(platform);
         test_scenario::return_shared(registry);
@@ -339,13 +339,14 @@ fun test_create_lock_zero_duration_fails() {
     let mut scenario = setup();
     setup_with_token(&mut scenario);
 
+    // M-04: no strategy arg
     scenario.next_tx(USER);
     {
         let mut platform = scenario.take_shared<Platform>();
         let mut registry = scenario.take_shared<UserRegistry>();
         let coin         = coin::mint_for_testing<USDC>(10_000, scenario.ctx());
         let clock        = make_clock(0, scenario.ctx());
-        sentra::create_lock<USDC>(&mut platform, &mut registry, coin, 0, 0, &clock, scenario.ctx());
+        sentra::create_lock<USDC>(&mut platform, &mut registry, coin, 0, &clock, scenario.ctx());
         clock::destroy_for_testing(clock);
         test_scenario::return_shared(platform);
         test_scenario::return_shared(registry);
@@ -360,13 +361,14 @@ fun test_create_lock_amount_too_small_fails() {
     let mut scenario = setup();
     setup_with_token(&mut scenario);
 
+    // M-04: no strategy arg
     scenario.next_tx(USER);
     {
         let mut platform = scenario.take_shared<Platform>();
         let mut registry = scenario.take_shared<UserRegistry>();
-        let coin  = coin::mint_for_testing<USDC>(1, scenario.ctx());
-        let clock = make_clock(0, scenario.ctx());
-        sentra::create_lock<USDC>(&mut platform, &mut registry, coin, 1000, 0, &clock, scenario.ctx());
+        let coin         = coin::mint_for_testing<USDC>(1, scenario.ctx());
+        let clock        = make_clock(0, scenario.ctx());
+        sentra::create_lock<USDC>(&mut platform, &mut registry, coin, 1000, &clock, scenario.ctx());
         clock::destroy_for_testing(clock);
         test_scenario::return_shared(platform);
         test_scenario::return_shared(registry);
@@ -375,39 +377,21 @@ fun test_create_lock_amount_too_small_fails() {
     scenario.end();
 }
 
-#[test]
-#[expected_failure(abort_code = sentra::EInvalidStrategy)]
-fun test_create_lock_wrong_strategy_fails() {
-    let mut scenario = setup();
-    setup_with_token(&mut scenario);
 
-    scenario.next_tx(USER);
-    {
-        let mut platform = scenario.take_shared<Platform>();
-        let mut registry = scenario.take_shared<UserRegistry>();
-        let coin  = coin::mint_for_testing<USDC>(10_000, scenario.ctx());
-        let clock = make_clock(0, scenario.ctx());
-        sentra::create_lock<USDC>(&mut platform, &mut registry, coin, 1000, 1, &clock, scenario.ctx());
-        clock::destroy_for_testing(clock);
-        test_scenario::return_shared(platform);
-        test_scenario::return_shared(registry);
-    };
-
-    scenario.end();
-}
 
 #[test]
 #[expected_failure(abort_code = sentra::EPlatformNotFound)]
 fun test_create_lock_unsupported_token_fails() {
     let mut scenario = setup();
 
+    // M-04: no strategy arg
     scenario.next_tx(USER);
     {
         let mut platform = scenario.take_shared<Platform>();
         let mut registry = scenario.take_shared<UserRegistry>();
-        let coin  = coin::mint_for_testing<USDC>(10_000, scenario.ctx());
-        let clock = make_clock(0, scenario.ctx());
-        sentra::create_lock<USDC>(&mut platform, &mut registry, coin, 1000, 0, &clock, scenario.ctx());
+        let coin         = coin::mint_for_testing<USDC>(10_000, scenario.ctx());
+        let clock        = make_clock(0, scenario.ctx());
+        sentra::create_lock<USDC>(&mut platform, &mut registry, coin, 1000, &clock, scenario.ctx());
         clock::destroy_for_testing(clock);
         test_scenario::return_shared(platform);
         test_scenario::return_shared(registry);
@@ -431,6 +415,7 @@ fun test_add_to_lock_success() {
         let extra_coin   = coin::mint_for_testing<USDC>(5_000, scenario.ctx());
         sentra::add_to_lock<USDC>(&mut lock, &mut platform, extra_coin, scenario.ctx());
 
+        // Initial balance 9_990 + extra after fee: ceil(5_000 * 10 / 10_000) = 5 → 4_995
         assert!(sentra::lock_balance_value(&lock) == 14_985, 0);
 
         test_scenario::return_shared(platform);
@@ -451,7 +436,7 @@ fun test_add_to_lock_wrong_owner_fails() {
     {
         let mut platform = scenario.take_shared<Platform>();
         let mut lock     = test_scenario::take_from_address<Lock<USDC>>(&scenario, USER);
-        let extra         = coin::mint_for_testing<USDC>(5_000, scenario.ctx());
+        let extra        = coin::mint_for_testing<USDC>(5_000, scenario.ctx());
         sentra::add_to_lock<USDC>(&mut lock, &mut platform, extra, scenario.ctx());
         test_scenario::return_to_address(USER, lock);
         test_scenario::return_shared(platform);
@@ -473,7 +458,7 @@ fun test_withdraw_on_time_no_penalty() {
         let mut platform = scenario.take_shared<Platform>();
         let mut registry = scenario.take_shared<UserRegistry>();
         let lock         = scenario.take_from_sender<Lock<USDC>>();
-        let clock = make_clock(2_000, scenario.ctx());
+        let clock        = make_clock(2_000, scenario.ctx());
         sentra::withdraw<USDC>(lock, &mut platform, &mut registry, &clock, scenario.ctx());
         clock::destroy_for_testing(clock);
         test_scenario::return_shared(platform);
@@ -483,6 +468,7 @@ fun test_withdraw_on_time_no_penalty() {
     scenario.next_tx(USER);
     {
         let received = scenario.take_from_sender<Coin<USDC>>();
+        // Locked amount after deposit fee: 10_000 - 10 = 9_990, no penalty
         assert!(coin::value(&received) == 9_990, 0);
         scenario.return_to_sender(received);
     };
@@ -498,13 +484,12 @@ fun test_withdraw_early_penalty_applied() {
     setup_with_token(&mut scenario);
     create_user_lock(&mut scenario, 10_000, 10_000);
 
-
     scenario.next_tx(USER);
     {
         let mut platform = scenario.take_shared<Platform>();
         let mut registry = scenario.take_shared<UserRegistry>();
         let lock         = scenario.take_from_sender<Lock<USDC>>();
-        let clock = make_clock(0, scenario.ctx());
+        let clock        = make_clock(0, scenario.ctx());
         sentra::withdraw<USDC>(lock, &mut platform, &mut registry, &clock, scenario.ctx());
         clock::destroy_for_testing(clock);
         test_scenario::return_shared(platform);
@@ -514,6 +499,7 @@ fun test_withdraw_early_penalty_applied() {
     scenario.next_tx(USER);
     {
         let received = scenario.take_from_sender<Coin<USDC>>();
+        // Locked: 9_990. Penalty: floor(9_990 * 200 / 10_000) = 199. User gets 9_791.
         assert!(coin::value(&received) == 9_791, 0);
         scenario.return_to_sender(received);
     };
@@ -566,6 +552,9 @@ fun test_create_yield_lock_success() {
     let mut scenario = setup();
     setup_with_s_coin(&mut scenario);
 
+    // s_coin = 50_000; deposit fee = ceil(50_000 * 10 / 10_000) = 50
+    // s_coin_balance after fee = 49_950
+    // H-02: caller supplies principal_base_amount in base token units
     scenario.next_tx(USER);
     {
         let mut platform = scenario.take_shared<Platform>();
@@ -576,7 +565,8 @@ fun test_create_yield_lock_success() {
             &mut platform,
             &mut registry,
             s_coin,
-            60_000, 
+            60_000,
+            49_950, // H-02: base token equivalent at current rate (1:1 in tests)
             b"test yield lock",
             &clock,
             scenario.ctx(),
@@ -593,11 +583,12 @@ fun test_create_yield_lock_success() {
 
         assert!(sentra::yield_lock_owner(&lock) == USER, 0);
         assert!(sentra::yield_lock_duration_ms(&lock) == 60_000, 1);
+        // H-02: principal_base_amount is the caller-supplied base amount
         assert!(sentra::yield_lock_principal_amount(&lock) == 49_950, 2);
         assert!(sentra::yield_lock_s_coin_balance_value(&lock) == 49_950, 3);
 
-        let yield_locks = sentra::get_user_yield_locks(&registry, USER);
-        assert!(vector::length(&yield_locks) == 1, 4);
+        // M-03: get_user_yield_locks (vector) removed — use user_has_yield_locks
+        assert!(sentra::user_has_yield_locks(&registry, USER), 4);
 
         test_scenario::return_shared(registry);
         scenario.return_to_sender(lock);
@@ -612,6 +603,7 @@ fun test_create_yield_lock_zero_duration_fails() {
     let mut scenario = setup();
     setup_with_s_coin(&mut scenario);
 
+    // H-02: principal_base_amount added; duration check fires first
     scenario.next_tx(USER);
     {
         let mut platform = scenario.take_shared<Platform>();
@@ -619,7 +611,7 @@ fun test_create_yield_lock_zero_duration_fails() {
         let s_coin       = coin::mint_for_testing<SCOIN>(50_000, scenario.ctx());
         let clock        = make_clock(0, scenario.ctx());
         sentra::create_yield_lock<USDC, SCOIN>(
-            &mut platform, &mut registry, s_coin, 0, b"", &clock, scenario.ctx(),
+            &mut platform, &mut registry, s_coin, 0, 1, b"", &clock, scenario.ctx(),
         );
         clock::destroy_for_testing(clock);
         test_scenario::return_shared(platform);
@@ -636,6 +628,7 @@ fun test_add_to_yield_lock_success() {
     let mut scenario = setup();
     setup_with_s_coin(&mut scenario);
 
+    // s_coin = 50_000, fee = 50, s_coin_balance = 49_950, base = 49_950
     scenario.next_tx(USER);
     {
         let mut platform = scenario.take_shared<Platform>();
@@ -643,19 +636,25 @@ fun test_add_to_yield_lock_success() {
         let s_coin       = coin::mint_for_testing<SCOIN>(50_000, scenario.ctx());
         let clock        = make_clock(0, scenario.ctx());
         sentra::create_yield_lock<USDC, SCOIN>(
-            &mut platform, &mut registry, s_coin, 60_000, b"yield", &clock, scenario.ctx(),
+            &mut platform, &mut registry, s_coin, 60_000, 49_950, b"yield", &clock, scenario.ctx(),
         );
         clock::destroy_for_testing(clock);
         test_scenario::return_shared(platform);
         test_scenario::return_shared(registry);
     };
 
+    // extra s_coin = 20_000, fee = ceil(20_000 * 10 / 10_000) = 20
+    // added_s_coin_amount = 19_980; added_base_amount = 19_980 (1:1 in tests)
+    // new principal = 49_950 + 19_980 = 69_930
     scenario.next_tx(USER);
     {
         let mut platform  = scenario.take_shared<Platform>();
         let mut lock      = scenario.take_from_sender<YieldLock<SCOIN>>();
         let extra_s_coin  = coin::mint_for_testing<SCOIN>(20_000, scenario.ctx());
-        sentra::add_to_yield_lock<USDC, SCOIN>(&mut lock, &mut platform, extra_s_coin, scenario.ctx());
+        // H-02: added_base_amount is required
+        sentra::add_to_yield_lock<USDC, SCOIN>(
+            &mut lock, &mut platform, extra_s_coin, 19_980, scenario.ctx(),
+        );
 
         assert!(sentra::yield_lock_principal_amount(&lock) == 69_930, 0);
 
@@ -673,6 +672,7 @@ fun test_complete_yield_withdrawal_on_time_with_yield() {
     let mut scenario = setup();
     setup_with_s_coin(&mut scenario);
 
+    // s_coin = 50_000, fee = 50, s_coin_balance = 49_950, base = 49_950
     scenario.next_tx(USER);
     {
         let mut platform = scenario.take_shared<Platform>();
@@ -680,32 +680,37 @@ fun test_complete_yield_withdrawal_on_time_with_yield() {
         let s_coin       = coin::mint_for_testing<SCOIN>(50_000, scenario.ctx());
         let clock        = make_clock(0, scenario.ctx());
         sentra::create_yield_lock<USDC, SCOIN>(
-            &mut platform, &mut registry, s_coin, 1_000, b"y", &clock, scenario.ctx(),
+            &mut platform, &mut registry, s_coin, 1_000, 49_950, b"y", &clock, scenario.ctx(),
         );
         clock::destroy_for_testing(clock);
         test_scenario::return_shared(platform);
         test_scenario::return_shared(registry);
     };
 
+    // C-02: unlock_yield_lock_s_coin is entry fun — no return value; transfers
+    // the s_coin to the sender internally.
     scenario.next_tx(USER);
     {
-        let platform     = scenario.take_shared<Platform>();
-        let mut lock     = scenario.take_from_sender<YieldLock<SCOIN>>();
-        let returned_s   = sentra::unlock_yield_lock_s_coin<SCOIN>(&mut lock, &platform, scenario.ctx());
+        let platform  = scenario.take_shared<Platform>();
+        let mut lock  = scenario.take_from_sender<YieldLock<SCOIN>>();
+        sentra::unlock_yield_lock_s_coin<SCOIN>(&mut lock, &platform, scenario.ctx());
         assert!(sentra::yield_lock_s_coin_balance_value(&lock) == 0, 0);
-        transfer::public_transfer(returned_s, USER);
         test_scenario::return_shared(platform);
         scenario.return_to_sender(lock);
     };
 
-
+    // redeemed = 52_000 USDC
+    // yield = 52_000 - 49_950 = 2_050
+    // yield_fee = floor(2_050 * 3_000 / 10_000) = 615
+    // user_yield = 2_050 - 615 = 1_435
+    // user_total = 49_950 + 1_435 = 51_385 (on time, no penalty)
     scenario.next_tx(USER);
     {
-        let mut platform  = scenario.take_shared<Platform>();
-        let mut registry  = scenario.take_shared<UserRegistry>();
-        let lock          = scenario.take_from_sender<YieldLock<SCOIN>>();
-        let clock         = make_clock(2_000, scenario.ctx());
-        let redeemed      = coin::mint_for_testing<USDC>(52_000, scenario.ctx());
+        let mut platform = scenario.take_shared<Platform>();
+        let mut registry = scenario.take_shared<UserRegistry>();
+        let lock         = scenario.take_from_sender<YieldLock<SCOIN>>();
+        let clock        = make_clock(2_000, scenario.ctx());
+        let redeemed     = coin::mint_for_testing<USDC>(52_000, scenario.ctx());
         sentra::complete_yield_withdrawal_with_redeemed_coin<USDC, SCOIN>(
             lock, redeemed, &mut platform, &mut registry, &clock, scenario.ctx(),
         );
@@ -713,7 +718,6 @@ fun test_complete_yield_withdrawal_on_time_with_yield() {
         test_scenario::return_shared(platform);
         test_scenario::return_shared(registry);
     };
-
 
     scenario.next_tx(USER);
     {
@@ -748,6 +752,8 @@ fun test_complete_yield_withdrawal_early_with_penalty() {
     let mut scenario = setup();
     setup_with_s_coin(&mut scenario);
 
+    // s_coin = 10_000, fee = ceil(10_000 * 10 / 10_000) = 10
+    // s_coin_balance = 9_990, base = 9_990
     scenario.next_tx(USER);
     {
         let mut platform = scenario.take_shared<Platform>();
@@ -755,31 +761,34 @@ fun test_complete_yield_withdrawal_early_with_penalty() {
         let s_coin       = coin::mint_for_testing<SCOIN>(10_000, scenario.ctx());
         let clock        = make_clock(0, scenario.ctx());
         sentra::create_yield_lock<USDC, SCOIN>(
-            &mut platform, &mut registry, s_coin, 100_000, b"e", &clock, scenario.ctx(),
+            &mut platform, &mut registry, s_coin, 100_000, 9_990, b"e", &clock, scenario.ctx(),
         );
         clock::destroy_for_testing(clock);
         test_scenario::return_shared(platform);
         test_scenario::return_shared(registry);
     };
 
+    // C-02: entry fun, no return value
     scenario.next_tx(USER);
     {
-        let platform   = scenario.take_shared<Platform>();
-        let mut lock   = scenario.take_from_sender<YieldLock<SCOIN>>();
-        let s          = sentra::unlock_yield_lock_s_coin<SCOIN>(&mut lock, &platform, scenario.ctx());
-        transfer::public_transfer(s, USER);
+        let platform  = scenario.take_shared<Platform>();
+        let mut lock  = scenario.take_from_sender<YieldLock<SCOIN>>();
+        sentra::unlock_yield_lock_s_coin<SCOIN>(&mut lock, &platform, scenario.ctx());
         test_scenario::return_shared(platform);
         scenario.return_to_sender(lock);
     };
 
-
+    // redeemed = 9_990 (no yield, early exit)
+    // yield = 9_990 - 9_990 = 0
+    // penalty = floor(9_990 * 200 / 10_000) = 199
+    // user = 9_990 - 199 = 9_791
     scenario.next_tx(USER);
     {
-        let mut platform  = scenario.take_shared<Platform>();
-        let mut registry  = scenario.take_shared<UserRegistry>();
-        let lock          = scenario.take_from_sender<YieldLock<SCOIN>>();
-        let clock         = make_clock(0, scenario.ctx());
-        let redeemed      = coin::mint_for_testing<USDC>(9_990, scenario.ctx());
+        let mut platform = scenario.take_shared<Platform>();
+        let mut registry = scenario.take_shared<UserRegistry>();
+        let lock         = scenario.take_from_sender<YieldLock<SCOIN>>();
+        let clock        = make_clock(0, scenario.ctx());
+        let redeemed     = coin::mint_for_testing<USDC>(9_990, scenario.ctx());
         sentra::complete_yield_withdrawal_with_redeemed_coin<USDC, SCOIN>(
             lock, redeemed, &mut platform, &mut registry, &clock, scenario.ctx(),
         );
@@ -818,6 +827,7 @@ fun test_collect_deposit_fees() {
     scenario.next_tx(ADMIN);
     {
         let fee_coin = scenario.take_from_sender<Coin<USDC>>();
+        // ceil(10_000 * 10 / 10_000) = 10
         assert!(coin::value(&fee_coin) == 10, 0);
         scenario.return_to_sender(fee_coin);
     };
@@ -937,13 +947,13 @@ fun test_view_helpers() {
 fun test_get_user_locks_empty_when_none() {
     let mut scenario = setup();
 
+    // M-03: get_user_locks / get_user_yield_locks (vector) removed —
+    // use boolean presence helpers instead.
     scenario.next_tx(ADMIN);
     {
-        let registry    = scenario.take_shared<UserRegistry>();
-        let user_locks  = sentra::get_user_locks(&registry, USER);
-        let yield_locks = sentra::get_user_yield_locks(&registry, USER);
-        assert!(vector::is_empty(&user_locks), 0);
-        assert!(vector::is_empty(&yield_locks), 1);
+        let registry = scenario.take_shared<UserRegistry>();
+        assert!(!sentra::user_has_locks(&registry, USER), 0);
+        assert!(!sentra::user_has_yield_locks(&registry, USER), 1);
         test_scenario::return_shared(registry);
     };
 
@@ -963,11 +973,12 @@ fun test_multiple_locks_same_user() {
     {
         let platform = scenario.take_shared<Platform>();
         let registry = scenario.take_shared<UserRegistry>();
-        let user_locks = sentra::get_user_locks(&registry, USER);
-        assert!(vector::length(&user_locks) == 2, 0);
 
-        let global = sentra::platform_global_lock_list(&platform);
-        assert!(vector::length(&global) == 2, 1);
+        // M-03: vector-based get_user_locks removed — user_has_locks is O(1)
+        assert!(sentra::user_has_locks(&registry, USER), 0);
+
+        // M-03: platform_global_lock_list (vector) removed — use O(1) count
+        assert!(sentra::get_total_lock_count(&platform) == 2, 1);
 
         test_scenario::return_shared(platform);
         test_scenario::return_shared(registry);
