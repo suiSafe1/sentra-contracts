@@ -1,4 +1,4 @@
-/// # Sentra Token Locking Protocol
+/// # Sentra Token Locking Protocol - Audited by Syntrei
 ///
 /// ## Overview
 /// This module implements a token locking protocol with two strategies:
@@ -47,17 +47,12 @@ const EInvalidFeeRate: u64 = 13;
 const BPS_DENOM: u64 = 10_000;
 const STRATEGY_YIELD: u8 = 1;
 
-/// Default fee rates used only at init time — all fees are mutable via configure_platform_fees.
 const DEFAULT_PENALTY_BPS: u64 = 200;
 const DEFAULT_YIELD_FEE_BPS: u64 = 3000;
 const DEFAULT_DEPOSIT_FEE_BPS: u64 = 10;
 
 
-/// Standard lock for direct token locking (no yield generation).
-///
-/// H-03: `store` ability removed — cannot be transferred or wrapped after
-///       initial transfer to owner. Prevents registry desync.
-/// M-04: `strategy` field removed — Lock type itself encodes the strategy.
+
 public struct Lock<phantom CoinType> has key {
     id: UID,
     balance: Balance<CoinType>,
@@ -78,16 +73,12 @@ public struct YieldLock<phantom SCoin> has key {
     owner: address,
     start_time: u64,
     duration_ms: u64,
-    /// H-02: base token equivalent of the sCoin deposit at creation time.
     principal_base_amount: u64,
-    /// SCoin units — used for yield TVL bookkeeping only.
     principal_s_coin_amount: u64,
     coin_type: TypeName,
-    /// H-01: asserted on every add_to_yield_lock call.
     expected_s_coin_type: TypeName,
     s_coin_balance: Balance<SCoin>,
     description: String,
-    /// C-01: guards the two-step withdrawal sequence.
     s_coin_unlocked: bool,
 }
 
@@ -98,19 +89,7 @@ public struct TokenFeeConfig has store, copy, drop {
 }
 
 
-/// M-03: global_lock_list, global_yield_lock_list, and locks_by_token
-/// were previously vector<ID> / VecMap<TypeName, vector<ID>>. Linear-scan
-/// removal (remove_lock_id) was O(n) and would eventually cause withdrawals
-/// to exceed Sui's computation limit as the protocol grows.
-///
-/// Replaced with:
-///   - global_lock_list:       Table<ID, bool>  — O(1) insert and delete
-///   - global_yield_lock_list: Table<ID, bool>  — O(1) insert and delete
-///   - locks_by_token_count:   VecMap<TypeName, u64> — per-token lock count
-///     (the old vector<ID> per token is dropped; indexers handle enumeration)
-///
-/// UserRegistry also used vector<ID> per address. Replaced with
-/// Table<address, Table<ID, bool>> for O(1) per-user operations.
+
 public struct Platform has key, store {
     id: UID,
     admin: address,
@@ -124,29 +103,20 @@ public struct Platform has key, store {
     paused_withdrawals: bool,
     tvl_by_token: VecMap<TypeName, u64>,
     yield_tvl_by_token: VecMap<TypeName, u64>,
-    /// M-03: O(1) insert/delete, replaces vector<ID>
     global_lock_list: Table<ID, bool>,
-    /// M-03: O(1) insert/delete, replaces vector<ID>
     global_yield_lock_list: Table<ID, bool>,
-    /// M-03: count only per token type; full enumeration via Sui indexer
     locks_by_token_count: VecMap<TypeName, u64>,
-    /// M-03: count only per token type for yield locks
     yield_locks_by_token_count: VecMap<TypeName, u64>,
-    /// Configurable fee rates (in basis points, denominator = 10_000)
     penalty_bps: u64,
     yield_fee_bps: u64,
     default_deposit_fee_bps: u64,
 }
 
 
-/// M-03: per-user lock sets replaced with Table<ID, bool> for O(1) ops.
 public struct UserRegistry has key, store {
     id: UID,
-    /// M-03: Table<address, Table<ID, bool>> — O(1) insert/delete per user
     locks: Table<address, Table<ID, bool>>,
-    /// M-03: same pattern for yield locks
     yield_locks: Table<address, Table<ID, bool>>,
-    /// Track user counts for analytics (replaces vec_map::length)
     lock_user_count: u64,
     yield_lock_user_count: u64,
 }
@@ -195,8 +165,6 @@ public struct YieldLockCreated has copy, drop, store {
     s_coin_type: TypeName,
     start_time: u64,
     duration_ms: u64,
-    /// L-05: correctly named (was market_coin_id, which held the YieldLock
-    /// object ID — not a Scallop market coin ID).
     yield_lock_id: ID,
     description: String,
 }
@@ -213,6 +181,7 @@ public struct YieldLockExtended has copy, drop, store {
 
 public struct YieldLockWithdrawn has copy, drop, store {
     owner: address,
+    yield_lock_id: ID,
     principal_withdrawn: u64,
     yield_earned: u64,
     platform_yield_fee: u64,
@@ -272,7 +241,6 @@ fun init(ctx: &mut TxContext) {
 
     transfer::transfer(cap, tx_context::sender(ctx));
 
-    // M-03: UserRegistry uses Table instead of VecMap<address, vector<ID>>
     let registry = UserRegistry {
         id: object::new(ctx),
         locks: table::new(ctx),
@@ -282,7 +250,6 @@ fun init(ctx: &mut TxContext) {
     };
     transfer::share_object(registry);
 
-    // M-03: Platform uses Table for global lock lists
     let platform = Platform {
         id: platform_id,
         admin: tx_context::sender(ctx),
@@ -359,7 +326,6 @@ public entry fun add_token_support<CoinType>(
 
         vec_map::insert(&mut platform.tvl_by_token, token_type, 0);
         vec_map::insert(&mut platform.yield_tvl_by_token, token_type, 0);
-        // M-03: insert a count entry instead of an empty vector
         vec_map::insert(&mut platform.locks_by_token_count, token_type, 0);
         vec_map::insert(&mut platform.yield_locks_by_token_count, token_type, 0);
 
@@ -418,15 +384,7 @@ public entry fun configure_token_fee<CoinType>(
 }
 
 
-/// Update the three platform-wide fee rates.
-///
-/// penalty_bps          — early withdrawal penalty (default 200 = 2%)
-/// yield_fee_bps        — platform cut of generated yield (default 3000 = 30%)
-/// default_deposit_fee_bps — initial deposit fee applied to newly added tokens (default 10 = 0.1%)
-///
-/// All values are in basis points (1 bps = 0.01%). Each must be <= BPS_DENOM (10 000).
-/// penalty_bps + yield_fee_bps must not exceed BPS_DENOM so that a user can always
-/// receive at least some of their funds back.
+
 public entry fun configure_platform_fees(
     cap: &AdminCap,
     platform: &mut Platform,
@@ -442,7 +400,6 @@ public entry fun configure_platform_fees(
     assert!(penalty_bps <= BPS_DENOM, EInvalidFeeRate);
     assert!(yield_fee_bps <= BPS_DENOM, EInvalidFeeRate);
     assert!(default_deposit_fee_bps <= BPS_DENOM, EInvalidFeeRate);
-    // Ensure users always receive something back even in the worst case
     assert!(penalty_bps + yield_fee_bps <= BPS_DENOM, EInvalidFeeRate);
 
     platform.penalty_bps = penalty_bps;
@@ -490,7 +447,6 @@ public entry fun accept_admin_transfer(
     assert!(object::id(&cap) == platform.admin_cap_id, EInvalidCapId);
 
     platform.admin = new_admin;
-    // L-02: keep admin_cap_id in sync after transfer
     platform.admin_cap_id = object::id(&cap);
     transfer::transfer(cap, new_admin);
     object::delete(id);
@@ -524,8 +480,7 @@ fun safe_mul_div_ceil(amount: u64, numerator: u64, denominator: u64): u64 {
 }
 
 
-/// M-01: aborts with EInsufficientForFee when fee >= amount instead of
-/// silently returning amount - 1.
+
 fun calculate_deposit_fee(amount: u64, fee_config: &TokenFeeConfig): u64 {
     let percentage_fee = safe_mul_div_ceil(amount, fee_config.deposit_fee_bps, BPS_DENOM);
 
@@ -546,8 +501,6 @@ fun calculate_deposit_fee(amount: u64, fee_config: &TokenFeeConfig): u64 {
 }
 
 
-/// M-03: register a lock ID into the user's per-address Table.
-/// Table operations are O(1) — no linear scan.
 fun registry_add_lock(registry: &mut UserRegistry, owner: address, lock_id: ID, ctx: &mut TxContext) {
     if (!table::contains(&registry.locks, owner)) {
         table::add(&mut registry.locks, owner, table::new<ID, bool>(ctx));
@@ -556,19 +509,16 @@ fun registry_add_lock(registry: &mut UserRegistry, owner: address, lock_id: ID, 
     table::add(table::borrow_mut(&mut registry.locks, owner), lock_id, true);
 }
 
-/// M-03: remove a lock ID from the user's per-address Table in O(1).
 fun registry_remove_lock(registry: &mut UserRegistry, owner: address, lock_id: ID) {
     if (table::contains(&registry.locks, owner)) {
         let user_table = table::borrow_mut(&mut registry.locks, owner);
         if (table::contains(user_table, lock_id)) {
             table::remove(user_table, lock_id);
         };
-        // Note: we intentionally leave the empty inner Table in place to avoid
-        // the cost of destroying it. table::length is O(1) for count checks.
+
     };
 }
 
-/// M-03: register a yield lock ID into the user's per-address Table.
 fun registry_add_yield_lock(registry: &mut UserRegistry, owner: address, lock_id: ID, ctx: &mut TxContext) {
     if (!table::contains(&registry.yield_locks, owner)) {
         table::add(&mut registry.yield_locks, owner, table::new<ID, bool>(ctx));
@@ -577,7 +527,6 @@ fun registry_add_yield_lock(registry: &mut UserRegistry, owner: address, lock_id
     table::add(table::borrow_mut(&mut registry.yield_locks, owner), lock_id, true);
 }
 
-/// M-03: remove a yield lock ID from the user's per-address Table in O(1).
 fun registry_remove_yield_lock(registry: &mut UserRegistry, owner: address, lock_id: ID) {
     if (table::contains(&registry.yield_locks, owner)) {
         let user_table = table::borrow_mut(&mut registry.yield_locks, owner);
@@ -606,7 +555,6 @@ fun update_yield_tvl<CoinType>(platform: &mut Platform, amount_delta: u64, is_ad
     }
 }
 
-/// M-03: O(1) per-token count helpers
 fun increment_token_lock_count(platform: &mut Platform, token_type: TypeName) {
     if (vec_map::contains(&platform.locks_by_token_count, &token_type)) {
         let c = vec_map::get_mut(&mut platform.locks_by_token_count, &token_type);
@@ -636,11 +584,7 @@ fun decrement_token_yield_lock_count(platform: &mut Platform, token_type: TypeNa
 }
 
 
-/// Create a standard lock (no yield generation).
-///
-/// M-03: uses Table-based registry and global_lock_list — O(1) operations.
-/// M-04: strategy parameter removed; Lock type encodes it.
-/// H-03: Lock has no store ability.
+
 public entry fun create_lock<CoinType>(
     platform: &mut Platform,
     registry: &mut UserRegistry,
@@ -682,11 +626,9 @@ public entry fun create_lock<CoinType>(
 
     let lock_id = object::id(&lock);
 
-    // M-03: O(1) registry insert
     registry_add_lock(registry, owner, lock_id, ctx);
 
     update_tvl<CoinType>(platform, amount, true);
-    // M-03: O(1) global list insert
     table::add(&mut platform.global_lock_list, lock_id, true);
     increment_token_lock_count(platform, token_type);
 
@@ -740,10 +682,6 @@ public entry fun add_to_lock<CoinType>(
 }
 
 
-/// Withdraw from a standard lock.
-///
-/// M-02: TVL decremented by user_amount only; penalty remains in platform.fees.
-/// M-03: O(1) registry and global list removal via Table.
 public entry fun withdraw<CoinType>(
     lock: Lock<CoinType>,
     platform: &mut Platform,
@@ -782,13 +720,10 @@ public entry fun withdraw<CoinType>(
         balance::join(bag::borrow_mut(&mut platform.fees, token_type), penalty_balance);
     };
 
-    // M-03: O(1) registry removal
     registry_remove_lock(registry, sender, lock_id);
 
-    // M-02: decrement by user_amount only; penalty stays in platform.fees
     update_tvl<CoinType>(platform, user_amount, false);
 
-    // M-03: O(1) Table removal — no linear scan
     if (table::contains(&platform.global_lock_list, lock_id)) {
         table::remove(&mut platform.global_lock_list, lock_id);
     };
@@ -805,18 +740,12 @@ public entry fun withdraw<CoinType>(
 }
 
 
-/// Create a yield lock using Scallop sCoin.
-///
-/// H-01: expected_s_coin_type stored for enforcement in add_to_yield_lock.
-/// H-02: caller supplies principal_base_amount in base token units.
-/// L-05: event field correctly named yield_lock_id.
-/// M-03: O(1) Table operations for registry and global list.
+
 public entry fun create_yield_lock<CoinType, SCoin>(
     platform: &mut Platform,
     registry: &mut UserRegistry,
     mut s_coin: Coin<SCoin>,
     duration_ms: u64,
-    /// H-02: base token equivalent of the SCoin deposit at current Scallop rate.
     principal_base_amount: u64,
     description: vector<u8>,
     clock: &Clock,
@@ -846,6 +775,8 @@ public entry fun create_yield_lock<CoinType, SCoin>(
     let principal_s_coin_amount = coin::value(&s_coin);
     assert!(principal_s_coin_amount > 0, EInvalidAmount);
 
+    let adjusted_principal_base_amount = safe_mul_div(principal_base_amount, principal_s_coin_amount, total_amount);
+
     let now = clock.timestamp_ms();
     let owner = tx_context::sender(ctx);
     let description_str = string::utf8(description);
@@ -855,7 +786,7 @@ public entry fun create_yield_lock<CoinType, SCoin>(
         owner,
         start_time: now,
         duration_ms,
-        principal_base_amount,
+        principal_base_amount: adjusted_principal_base_amount,
         principal_s_coin_amount,
         coin_type: token_type,
         expected_s_coin_type: s_coin_type,
@@ -866,11 +797,9 @@ public entry fun create_yield_lock<CoinType, SCoin>(
 
     let lock_id = object::id(&yield_lock);
 
-    // M-03: O(1) registry insert
     registry_add_yield_lock(registry, owner, lock_id, ctx);
 
     update_yield_tvl<CoinType>(platform, principal_s_coin_amount, true);
-    // M-03: O(1) global list insert
     table::add(&mut platform.global_yield_lock_list, lock_id, true);
     increment_token_yield_lock_count(platform, token_type);
 
@@ -879,7 +808,7 @@ public entry fun create_yield_lock<CoinType, SCoin>(
     event::emit(YieldLockCreated {
         owner,
         principal_s_coin_amount,
-        principal_base_amount,
+        principal_base_amount: adjusted_principal_base_amount,
         deposit_fee_paid: deposit_fee,
         coin_type: token_type,
         s_coin_type,
@@ -891,10 +820,7 @@ public entry fun create_yield_lock<CoinType, SCoin>(
 }
 
 
-/// Add SCoin to an existing yield lock.
-///
-/// H-01: asserts SCoin type matches expected_s_coin_type.
-/// H-02: caller supplies added_base_amount to keep principal_base_amount accurate.
+
 public entry fun add_to_yield_lock<CoinType, SCoin>(
     yield_lock: &mut YieldLock<SCoin>,
     platform: &mut Platform,
@@ -929,7 +855,9 @@ public entry fun add_to_yield_lock<CoinType, SCoin>(
     let added_s_coin_amount = added_balance.value();
     balance::join(&mut yield_lock.s_coin_balance, added_balance);
 
-    yield_lock.principal_base_amount = yield_lock.principal_base_amount + added_base_amount;
+
+    let adjusted_added_base_amount = safe_mul_div(added_base_amount, added_s_coin_amount, total_amount);
+    yield_lock.principal_base_amount = yield_lock.principal_base_amount + adjusted_added_base_amount;
     yield_lock.principal_s_coin_amount = yield_lock.principal_s_coin_amount + added_s_coin_amount;
 
     update_yield_tvl<CoinType>(platform, added_s_coin_amount, true);
@@ -949,19 +877,19 @@ public entry fun add_to_yield_lock<CoinType, SCoin>(
 /// Step 1 of yield lock withdrawal: extract SCoin from the contract.
 ///
 /// C-01: sets s_coin_unlocked = true; aborts on double-call (EAlreadyUnlocked).
-/// C-02: entry fun — only callable from a user-initiated transaction, not
-///       from other modules.
-public entry fun unlock_yield_lock_s_coin<SCoin>(
+/// Returns the SCoin so it can be piped directly into burn_s_coin in a PTB.
+/// Security is enforced by the owner assertion — tx_context::sender cannot be
+/// spoofed by a calling module, so no additional `entry` guard is needed.
+public fun unlock_yield_lock_s_coin<SCoin>(
     yield_lock: &mut YieldLock<SCoin>,
     platform: &Platform,
     ctx: &mut TxContext
-) {
+): coin::Coin<SCoin> {
     assert!(!platform.paused_withdrawals, EPaused);
 
     let sender = tx_context::sender(ctx);
     assert!(sender == yield_lock.owner, EUnauthorized);
 
-    // C-01: prevent double-unlock
     assert!(!yield_lock.s_coin_unlocked, EAlreadyUnlocked);
 
     let amount = yield_lock.s_coin_balance.value();
@@ -970,7 +898,7 @@ public entry fun unlock_yield_lock_s_coin<SCoin>(
     let s_coin = coin::take(&mut yield_lock.s_coin_balance, amount, ctx);
     yield_lock.s_coin_unlocked = true;
 
-    transfer::public_transfer(s_coin, sender);
+    s_coin
 }
 
 
@@ -1088,6 +1016,7 @@ public entry fun complete_yield_withdrawal_with_redeemed_coin<CoinType, SCoin>(
 
     event::emit(YieldLockWithdrawn {
         owner: sender,
+        yield_lock_id: lock_id,
         principal_withdrawn: user_principal,
         yield_earned: total_yield,
         platform_yield_fee,
@@ -1181,70 +1110,58 @@ public fun get_pause_status(platform: &Platform): (bool, bool) {
     (platform.paused_deposits, platform.paused_withdrawals)
 }
 
-/// M-03: returns whether a user has any locks — O(1) Table contains check.
 public fun user_has_locks(registry: &UserRegistry, user: address): bool {
     if (!table::contains(&registry.locks, user)) return false;
     table::length(table::borrow(&registry.locks, user)) > 0
 }
 
-/// M-03: returns whether a user has any yield locks — O(1).
 public fun user_has_yield_locks(registry: &UserRegistry, user: address): bool {
     if (!table::contains(&registry.yield_locks, user)) return false;
     table::length(table::borrow(&registry.yield_locks, user)) > 0
 }
 
-/// M-03: returns whether a specific lock ID belongs to a user — O(1).
 public fun user_owns_lock(registry: &UserRegistry, user: address, lock_id: ID): bool {
     if (!table::contains(&registry.locks, user)) return false;
     table::contains(table::borrow(&registry.locks, user), lock_id)
 }
 
-/// M-03: returns whether a specific yield lock ID belongs to a user — O(1).
 public fun user_owns_yield_lock(registry: &UserRegistry, user: address, lock_id: ID): bool {
     if (!table::contains(&registry.yield_locks, user)) return false;
     table::contains(table::borrow(&registry.yield_locks, user), lock_id)
 }
 
-/// M-03: lock exists in global list — O(1).
 public fun lock_exists(platform: &Platform, lock_id: ID): bool {
     table::contains(&platform.global_lock_list, lock_id)
 }
 
-/// M-03: yield lock exists in global list — O(1).
 public fun yield_lock_exists(platform: &Platform, lock_id: ID): bool {
     table::contains(&platform.global_yield_lock_list, lock_id)
 }
 
-/// M-03: total lock count from global Table — O(1).
 public fun get_total_lock_count(platform: &Platform): u64 {
     table::length(&platform.global_lock_list)
 }
 
-/// M-03: total yield lock count from global Table — O(1).
 public fun get_total_yield_lock_count(platform: &Platform): u64 {
     table::length(&platform.global_yield_lock_list)
 }
 
-/// M-03: per-token lock count — O(1).
 public fun get_lock_count_for_token(platform: &Platform, token_type: TypeName): u64 {
     if (vec_map::contains(&platform.locks_by_token_count, &token_type)) {
         *vec_map::get(&platform.locks_by_token_count, &token_type)
     } else { 0 }
 }
 
-/// M-03: per-token yield lock count — O(1).
 public fun get_yield_lock_count_for_token(platform: &Platform, token_type: TypeName): u64 {
     if (vec_map::contains(&platform.yield_locks_by_token_count, &token_type)) {
         *vec_map::get(&platform.yield_locks_by_token_count, &token_type)
     } else { 0 }
 }
 
-/// M-03: total unique addresses with locks.
 public fun get_total_users_with_locks(registry: &UserRegistry): u64 {
     registry.lock_user_count
 }
 
-/// M-03: total unique addresses with yield locks.
 public fun get_total_users_with_yield_locks(registry: &UserRegistry): u64 {
     registry.yield_lock_user_count
 }
@@ -1283,7 +1200,6 @@ public fun lock_start_time<CoinType>(lock: &Lock<CoinType>): u64 { lock.start_ti
 public fun lock_duration_ms<CoinType>(lock: &Lock<CoinType>): u64 { lock.duration_ms }
 
 public fun yield_lock_owner<SCoin>(lock: &YieldLock<SCoin>): address { lock.owner }
-/// H-02: returns principal in base token units
 public fun yield_lock_principal_amount<SCoin>(lock: &YieldLock<SCoin>): u64 { lock.principal_base_amount }
 public fun yield_lock_s_coin_balance_value<SCoin>(lock: &YieldLock<SCoin>): u64 { lock.s_coin_balance.value() }
 public fun yield_lock_start_time<SCoin>(lock: &YieldLock<SCoin>): u64 { lock.start_time }
@@ -1298,7 +1214,6 @@ public fun platform_fees(platform: &Platform): &Bag { &platform.fees }
 public fun platform_yield_fees(platform: &Platform): &Bag { &platform.yield_fees }
 public fun platform_deposit_fees(platform: &Platform): &Bag { &platform.deposit_fees }
 public fun get_admin(platform: &Platform): address { platform.admin }
-/// Exposed for fee_router.move H-04 gate
 public fun platform_admin_cap_id(platform: &Platform): ID { platform.admin_cap_id }
 
 public fun platform_penalty_bps(platform: &Platform): u64 { platform.penalty_bps }
